@@ -309,11 +309,17 @@ public class MainActivity extends Activity {
             ui.post(() -> startActivity(
                     new Intent(Intent.ACTION_VIEW, Uri.parse(Onramp.fundUrl(address)))));
             long deadline = System.currentTimeMillis() + GATE_TIMEOUT_MS;
-            while ((cap = Onramp.capability(address)) == null) {
+            while (cap == null) {
                 if (cancelled || System.currentTimeMillis() > deadline) {
                     return null;
                 }
                 Thread.sleep(GATE_POLL_MS);
+                try {
+                    cap = Onramp.capability(address);
+                } catch (IOException e) {
+                    // Android cuts a background app's network while the browser is in front,
+                    // so a poll fails until the person comes back; keep polling.
+                }
             }
         }
         writePrivate(capFile, cap.token);

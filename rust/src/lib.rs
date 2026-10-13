@@ -363,8 +363,9 @@ async fn pull(request: Request) -> anyhow::Result<Ended> {
 
     let report = &outcome.report;
     let mut summary = format!(
-        "{} fetched, {} skipped, {} failed; paid for {} bytes",
-        report.fetched, report.skipped, report.failed, report.downloaded
+        "{} fetched, {} copied from files already on the phone, {} skipped, {} failed; \
+         paid for {} bytes",
+        report.fetched, report.linked, report.skipped, report.failed, report.downloaded
     );
     for failure in &report.failures {
         summary.push_str(&format!("\n{}: {}", failure.path, failure.error));
