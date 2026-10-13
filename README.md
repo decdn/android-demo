@@ -8,11 +8,12 @@ A one-screen Android app that downloads files from [deCDN](https://github.com/de
 on a phone. It runs the [deCDN client SDK](https://docs.rs/decdn-client) (`decdn-client`)
 natively: it finds the nodes that hold a blob, streams it from all of them at once, verifies
 every byte against its BLAKE3 hash as it arrives, and pays per megabyte in USDC from a payment
-pool. A delegated capability funds the pool, so the phone holds no USDC and no wallet.
+pool. A sponsor funds that pool, so the phone holds no USDC and no wallet.
 
-Enter a content hash, tap **Download**, and the verified file lands in `Download/decdn/`. Tick
-**Whole bundle** and the hash names a bundle manifest instead: every file it lists lands under a
-folder of its own.
+Enter a content hash and tap **Download**. The first time, the app opens a one-step check in the
+browser; come back to the app and the download starts. The verified file lands in
+`Download/decdn/`. Tick **Whole bundle** and the hash names a bundle manifest instead: every file
+it lists lands under a folder of its own.
 
 On a Pixel 8a over home Wi-Fi, a 4.2 GiB video bundle downloads at about 8 MiB/s, and an
 interrupted pull resumes from the bytes already on disk without paying for them twice.
@@ -21,13 +22,13 @@ interrupted pull resumes from the bytes already on disk without paying for them 
 
 ```text
 ┌──────────── Android app ────────────┐
-│ MainActivity (Java)                 │
-│   hash, namespace, capability       │
-│        │ JNI             ▲ progress │
-│        ▼                 │          │
+│ MainActivity (Java)                 │      ┌────────────┐
+│   hash, namespace ──────────────────┼─────▶│ onramp     │  up.decdn.org: a capability for
+│        │ JNI             ▲ progress │      │            │  the app's key, after a browser check
+│        ▼                 │          │      └────────────┘
 │ libdecdn_android.so (Rust)          │      ┌────────────┐
 │   decdn-client BundlePuller ────────┼─────▶│ deCDN nodes│  iroh QUIC, paid per MB
-│   CredentialSlot (delegated key)    │      └────────────┘
+│   throwaway key + capability        │      └────────────┘
 │        │                            │      ┌────────────┐
 │        └────────────────────────────┼─────▶│ Arbitrum   │  pool + registry reads
 └─────────────────────────────────────┘      │ Sepolia    │
@@ -39,6 +40,7 @@ interrupted pull resumes from the bytes already on disk without paying for them 
   and verification all come from the SDK. A single file is a one-entry manifest built in code.
   A `BundleObserver` feeds verified-byte counts to the UI.
 - [`MainActivity.java`](app/src/main/java/dev/decdn/demo/MainActivity.java) is the screen. It
+  gets an allowance through [`Onramp.java`](app/src/main/java/dev/decdn/demo/Onramp.java),
   calls `Native.pull` on a worker thread, polls `Native.progress` every 500 ms, and copies the
   finished files into `Download/decdn/` through `MediaStore`.
 - `Native.init` hands the app's `Context` to two crates that read Android system state over
@@ -70,34 +72,25 @@ and launches it. `./build.sh apk` builds without installing. The script finds th
 `~/Library/Android/sdk` or `~/Android/Sdk` and the newest NDK inside it; set `ANDROID_HOME` or
 `ANDROID_NDK_HOME` to override.
 
-## Load a key and a capability
+## The sponsored allowance
 
-The app pays as a delegate: a throwaway key plus a `dcap1:` capability that a pool owner signed
-for it. Put three files in one directory, `keystore.json`, `password` and `capability`, then
-load them into the app:
+The app pays as a delegate of a [sponsord](https://github.com/decdn/sponsord) gateway, the same
+way its `decdn.sh` installer does:
 
-```bash
-./build.sh key ~/path/to/key-dir
-```
+1. On first launch the app makes a random throwaway key and keeps it in its private storage. The
+   key holds no funds.
+2. On **Download** with no allowance, the app opens the onramp's gate page,
+   `https://up.decdn.org/fund?client=<address>`, in the browser. Passing the check there has
+   the sponsor sign a capability for the app's key: the right to spend up to a cap from the
+   sponsor's pool until an expiry.
+3. Meanwhile the app polls `GET /v1/capability?client=<address>` every 2 s. The gate page says
+   to return to your terminal; switch back to the app instead. The capability is waiting, and the
+   download starts.
 
-There are two ways to get that directory.
-
-**From a sponsored download.** A [sponsord](https://github.com/decdn/sponsord) gateway's
-installer (`decdn.sh`) leaves exactly these files under
-`~/.decdn/sponsored/downloads/<hash>/` after a pull. The capability is bound to that key, and
-works for any content until it expires or its cap runs out.
-
-**From your own pool.** With the [`decdn` CLI](https://github.com/decdn/decdn) and a pool you
-own:
-
-```bash
-mkdir -p key && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > key/password
-decdn key-gen --output-dir key --keystore-password-file key/password
-decdn pool assign --pool 0x<your-pool-id> --signer 0x<address-key-gen-printed> \
-  --cap-micro-usdc 5000000 --expiry-secs 604800 | grep '^dcap1:' > key/capability
-```
-
-`--cap-micro-usdc 5000000` lets the key spend up to 5 USDC.
+The allowance line on the screen shows the key and how long its capability lasts. A capability's
+terms are fixed once issued, so when one runs out or comes within about an hour of expiry, the
+app starts over with a fresh key and sends you through the check again. An interrupted download
+resumes under the new key without paying twice for the bytes it has.
 
 ## Use it
 
@@ -107,7 +100,6 @@ decdn pool assign --pool 0x<your-pool-id> --signer 0x<address-key-gen-printed> \
 | Namespace | The publisher's namespace id. Empty sends none. |
 | Save as | The file name, or the folder name for a bundle |
 | Whole bundle | Tick when the hash is a bundle manifest |
-| Capability | Filled in from the loaded key; paste a fresh one here when it expires |
 
 The status line shows the phase (finding nodes, downloading, verifying), verified bytes against
 the total, and the current rate. **Cancel** stops the pull where it is; **Download** again

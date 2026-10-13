@@ -14,13 +14,21 @@ final class Native {
     static native int init(Context context);
 
     /**
+     * The address of the throwaway key in {@code keyFile}, generating a random key there first
+     * when the file is absent. Returns {@code "0x…"} or {@code "ERR <message>"}.
+     */
+    static native String address(String keyFile);
+
+    /**
      * Pulls {@code hash} into {@code outDir}, blocking until it ends. With {@code bundle} nonzero
      * the hash names a bundle manifest and every entry lands under {@code outDir}; otherwise the
-     * blob lands at {@code outDir/fileName}. A negative {@code namespace} sends none. Returns
-     * {@code "OK <summary>"} or {@code "ERR <message>"}.
+     * blob lands at {@code outDir/fileName}. A negative {@code namespace} sends none. The key in
+     * {@code keyFile} pays under {@code capability}. Returns {@code "OK <summary>"},
+     * {@code "FUNDING <message>"} when the capability cannot pay for the rest, or
+     * {@code "ERR <message>"}.
      */
     static native String pull(String hash, long namespace, String outDir, String fileName,
-            String keyDir, String dataDir, int bundle);
+            String keyFile, String capability, String dataDir, int bundle);
 
     /** The running pull: {@code "phase,received,expected,filesDone,filesTotal"}. */
     static native String progress();
