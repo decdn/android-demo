@@ -3,7 +3,6 @@
 #
 #   ./build.sh            build, install and launch
 #   ./build.sh apk        build only (app/build/outputs/apk/debug/app-debug.apk)
-#   ./build.sh key DIR    load a key dir (keystore.json, password, capability) into the app
 set -eu
 cd "$(dirname "$0")"
 
@@ -26,18 +25,6 @@ fi
 
 ADB="$ANDROID_HOME/platform-tools/adb"
 PKG=dev.decdn.demo
-
-if [ "${1:-}" = key ]; then
-  dir="${2:?usage: ./build.sh key DIR}"
-  # Straight into the app's private files dir (debug builds allow run-as).
-  "$ADB" shell run-as "$PKG" mkdir -p files/key
-  for f in keystore.json password capability; do
-    "$ADB" shell run-as "$PKG" sh -c "'cat > files/key/$f && chmod 600 files/key/$f'" <"$dir/$f"
-  done
-  "$ADB" shell am force-stop "$PKG"
-  "$ADB" shell am start -n "$PKG/.MainActivity"
-  exit 0
-fi
 
 (
   cd rust

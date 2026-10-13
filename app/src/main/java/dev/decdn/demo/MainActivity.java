@@ -2,6 +2,7 @@ package dev.decdn.demo;
 
 import android.app.Activity;
 import android.content.ContentValues;
+import android.content.Intent;
 import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Bundle;
@@ -33,13 +34,20 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * One screen: a content hash, a namespace and a capability in; verified files in Downloads/decdn
- * out. A pull fetches one blob, or with "Whole bundle" every file a bundle manifest lists. The
- * throwaway key is loaded into files/key/ with {@code ./build.sh key DIR}.
+ * One screen: a content hash and a namespace in; verified files in Downloads/decdn out. A pull
+ * fetches one blob, or with "Whole bundle" every file a bundle manifest lists.
+ *
+ * <p>The app pays with a random throwaway key it keeps in its private storage. Before the first
+ * pull, and whenever the allowance is spent or near expiry, it sends the person to the sponsored
+ * onramp's gate page in the browser and picks up the capability issued to its key.
  */
 public class MainActivity extends Activity {
     private static final String DEFAULT_HASH = "";
     private static final String[] PHASES = {"Starting", "Finding nodes", "Downloading", "Verifying"};
+    /** A saved capability with less life than this is replaced before a pull, as decdn.sh does. */
+    private static final long EXPIRY_MARGIN_S = 4020;
+    private static final long GATE_TIMEOUT_MS = 600_000;
+    private static final long GATE_POLL_MS = 2_000;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private File home;
@@ -48,11 +56,14 @@ public class MainActivity extends Activity {
     private EditText namespace;
     private EditText fileName;
     private CheckBox wholeBundle;
-    private EditText capability;
+    private TextView allowance;
     private Button download;
     private TextView status;
     private TextView details;
     private volatile boolean running;
+    private volatile boolean cancelled;
+    /** A status line that replaces the progress readout while set, such as the gate wait. */
+    private volatile String stage;
     private long startedAt;
     private long lastBytes;
     private long lastPollAt;
@@ -75,11 +86,35 @@ public class MainActivity extends Activity {
             download.setEnabled(false);
             return;
         }
-        File cap = new File(keyDir, "capability");
-        if (cap.exists()) {
-            capability.setText(read(cap).trim());
+        refreshAllowance();
+        status.setText("Ready.");
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (allowance != null && download.isEnabled()) {
+            refreshAllowance();
         }
-        status.setText(cap.exists() ? "Ready." : "No key yet: run ./build.sh key DIR");
+    }
+
+    /** Shows the saved allowance and the key it belongs to. */
+    private void refreshAllowance() {
+        keyDir.mkdirs();
+        String address = Native.address(keyFile().getAbsolutePath());
+        String key = address.startsWith("0x") && address.length() > 12
+                ? address.substring(0, 6) + "…" + address.substring(address.length() - 4)
+                : address;
+        long expiry = parseLong(read(new File(keyDir, "expiry")).trim());
+        long now = System.currentTimeMillis() / 1000;
+        if (new File(keyDir, "capability").exists() && expiry > now + EXPIRY_MARGIN_S) {
+            String until = new java.text.SimpleDateFormat("MMM d, HH:mm", Locale.US)
+                    .format(new java.util.Date(expiry * 1000));
+            allowance.setText("Sponsored allowance for key " + key + ", valid until " + until);
+        } else {
+            allowance.setText("Key " + key + " has no allowance yet. Download opens a quick "
+                    + "check in your browser first.");
+        }
     }
 
     private void buildUi() {
@@ -100,13 +135,15 @@ public class MainActivity extends Activity {
         wholeBundle = new CheckBox(this);
         wholeBundle.setText("Whole bundle (the hash is a bundle manifest)");
         col.addView(wholeBundle);
-        capability = field(col, "Capability (dcap1:…)", "");
-        capability.setMaxLines(3);
+        allowance = new TextView(this);
+        allowance.setPadding(0, dp(12), 0, dp(8));
+        col.addView(allowance);
 
         download = new Button(this);
         download.setText("Download");
         download.setOnClickListener(v -> {
             if (running) {
+                cancelled = true;
                 Native.cancel();
                 status.setText("Stopping…");
             } else {
@@ -157,13 +194,14 @@ public class MainActivity extends Activity {
         String h = hash.getText().toString().trim();
         String ns = namespace.getText().toString().trim();
         String name = fileName.getText().toString().trim();
-        String cap = capability.getText().toString().trim();
         boolean bundle = wholeBundle.isChecked();
-        if (h.isEmpty() || cap.isEmpty() || name.isEmpty()) {
-            status.setText("Hash, name and capability are required.");
+        if (h.isEmpty() || name.isEmpty()) {
+            status.setText("Hash and name are required.");
             return;
         }
         running = true;
+        cancelled = false;
+        stage = null;
         // Android cuts a sleeping app's network, so the screen stays on while a pull runs.
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         download.setText("Cancel");
@@ -176,31 +214,29 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             String result;
             try {
-                result = pull(h, ns, name, cap, bundle);
+                result = pull(h, ns, name, bundle);
             } catch (Exception e) {
                 result = "Failed: " + e;
             }
             String done = result;
             ui.post(() -> {
                 running = false;
+                stage = null;
                 getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                 status.setText(done);
                 download.setText("Download");
+                refreshAllowance();
             });
         }, "decdn-pull").start();
     }
 
     /** Runs on the worker thread. Returns the status line to show. */
-    private String pull(String h, String ns, String name, String cap, boolean bundle)
-            throws Exception {
-        File keystore = new File(keyDir, "keystore.json");
-        File password = new File(keyDir, "password");
-        if (!keystore.exists() || !password.exists()) {
-            return "No key: run ./build.sh key DIR";
+    private String pull(String h, String ns, String name, boolean bundle) throws Exception {
+        String cap = ensureCapability();
+        if (cap == null) {
+            return cancelled ? "Cancelled." : "No allowance yet: the browser check timed out.";
         }
-        File capFile = new File(keyDir, "capability");
-        Files.write(capFile.toPath(), cap.getBytes(StandardCharsets.UTF_8));
-        Os.chmod(capFile.getAbsolutePath(), 0600);
+        stage = null;
 
         File data = new File(home, "data");
         data.mkdirs();
@@ -211,9 +247,14 @@ public class MainActivity extends Activity {
 
         long nsValue = ns.isEmpty() ? -1 : Long.parseLong(ns);
         String reply = Native.pull(h, nsValue, outDir.getAbsolutePath(), name,
-                keyDir.getAbsolutePath(), data.getAbsolutePath(), bundle ? 1 : 0);
+                keyFile().getAbsolutePath(), cap, data.getAbsolutePath(), bundle ? 1 : 0);
         String summary = reply.length() > 3 ? reply.substring(reply.indexOf(' ') + 1) : reply;
         ui.post(() -> details.setText(summary));
+        if (reply.startsWith("FUNDING")) {
+            // A key's allowance is fixed once issued: the next one goes to a fresh key.
+            rotateKey();
+            return "The allowance ran out. Tap Download for a new one; the download resumes.";
+        }
         if (!reply.startsWith("OK")) {
             return "Download failed. See below.";
         }
@@ -240,6 +281,77 @@ public class MainActivity extends Activity {
                 files.size(), files.size() == 1 ? "" : "s", size(total), secs, copied, base);
     }
 
+    /**
+     * The capability for this app's key: the saved one while it has more than {@link
+     * #EXPIRY_MARGIN_S} of life, else the one the onramp issues after the person passes the gate
+     * in the browser. Runs on the worker thread. Returns {@code null} on cancel or timeout.
+     */
+    private String ensureCapability() throws Exception {
+        keyDir.mkdirs();
+        File capFile = new File(keyDir, "capability");
+        File expFile = new File(keyDir, "expiry");
+        long now = System.currentTimeMillis() / 1000;
+        if (capFile.exists()) {
+            if (parseLong(read(expFile).trim()) > now + EXPIRY_MARGIN_S) {
+                return read(capFile).trim();
+            }
+            // Too close to expiry to start on, and a key's allowance cannot be renewed.
+            rotateKey();
+        }
+        String address = Native.address(keyFile().getAbsolutePath());
+        if (!address.startsWith("0x")) {
+            throw new IOException(address);
+        }
+        stage = "Checking for an allowance…";
+        Onramp.Capability cap = Onramp.capability(address);
+        if (cap == null) {
+            stage = "Pass the check in your browser, then come back here.";
+            ui.post(() -> startActivity(
+                    new Intent(Intent.ACTION_VIEW, Uri.parse(Onramp.fundUrl(address)))));
+            long deadline = System.currentTimeMillis() + GATE_TIMEOUT_MS;
+            while (cap == null) {
+                if (cancelled || System.currentTimeMillis() > deadline) {
+                    return null;
+                }
+                Thread.sleep(GATE_POLL_MS);
+                try {
+                    cap = Onramp.capability(address);
+                } catch (IOException e) {
+                    // Android cuts a background app's network while the browser is in front,
+                    // so a poll fails until the person comes back; keep polling.
+                }
+            }
+        }
+        writePrivate(capFile, cap.token);
+        writePrivate(expFile, Long.toString(cap.expiry));
+        ui.post(this::refreshAllowance);
+        return cap.token;
+    }
+
+    /** Drops the key and its allowance; the next pull makes a fresh key. */
+    private void rotateKey() {
+        keyFile().delete();
+        new File(keyDir, "capability").delete();
+        new File(keyDir, "expiry").delete();
+    }
+
+    private File keyFile() {
+        return new File(keyDir, "key.hex");
+    }
+
+    private static void writePrivate(File f, String s) throws Exception {
+        Files.write(f.toPath(), s.getBytes(StandardCharsets.UTF_8));
+        Os.chmod(f.getAbsolutePath(), 0600);
+    }
+
+    private static long parseLong(String s) {
+        try {
+            return Long.parseLong(s);
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
     /** Every finished file under {@code dir}, skipping the pull's dot-files and partials. */
     private static void collect(File dir, List<File> out) {
         File[] children = dir.listFiles();
@@ -261,6 +373,12 @@ public class MainActivity extends Activity {
 
     private void poll() {
         if (!running) {
+            return;
+        }
+        String s0 = stage;
+        if (s0 != null) {
+            status.setText(s0);
+            ui.postDelayed(this::poll, 500);
             return;
         }
         String[] p = Native.progress().split(",");

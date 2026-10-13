@@ -12,6 +12,8 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use alloy::primitives::Address;
+use alloy::primitives::B256;
+use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context as _, bail};
 use decdn_client::bundle::{
     BundleEnd, BundleManifest, BundleObserver, BundlePuller, FileObserver, Funding, ManifestEntry,
@@ -21,7 +23,6 @@ use decdn_client::session::{ChainConfig, DiscoveryOptions, PullSite};
 use decdn_client::{CredentialSlot, endpoint};
 use decdn_incentive::CapabilityGrant;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
-use decdn_incentive::eth_identity::load_signer;
 use jni::EnvUnowned;
 use jni::errors::ThrowRuntimeExAndDefault;
 use jni::objects::{JObject, JString};
@@ -170,8 +171,12 @@ pub extern "system" fn Java_dev_decdn_demo_Native_init<'local>(
 /// Pulls `hash` into `outDir`, blocking until the pull ends. With `bundle`
 /// nonzero, `hash` names a bundle manifest and every entry lands under
 /// `outDir`; otherwise the blob lands at `outDir/fileName`. `namespace` < 0
-/// sends none. The key dir holds `keystore.json`, `password` and
-/// `capability`. Returns `OK <summary>` or `ERR <message>`.
+/// sends none. `keyFile` holds the delegate key that [`address`] made, and
+/// `capability` is the `dcap1:` token issued to it. Returns `OK <summary>`,
+/// `FUNDING <message>` when the capability cannot pay for the rest (the app
+/// then needs a fresh key and capability), or `ERR <message>`.
+///
+/// [`address`]: Java_dev_decdn_demo_Native_address
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_dev_decdn_demo_Native_pull<'local>(
@@ -181,7 +186,8 @@ pub extern "system" fn Java_dev_decdn_demo_Native_pull<'local>(
     namespace: jlong,
     out_dir: JString<'local>,
     file_name: JString<'local>,
-    key_dir: JString<'local>,
+    key_file: JString<'local>,
+    capability: JString<'local>,
     data_dir: JString<'local>,
     bundle: jint,
 ) -> JString<'local> {
@@ -192,15 +198,37 @@ pub extern "system" fn Java_dev_decdn_demo_Native_pull<'local>(
                 namespace: u64::try_from(namespace).ok(),
                 out_dir: PathBuf::from(out_dir.try_to_string(env)?),
                 file_name: file_name.try_to_string(env)?,
-                key_dir: PathBuf::from(key_dir.try_to_string(env)?),
+                key_file: PathBuf::from(key_file.try_to_string(env)?),
+                capability: capability.try_to_string(env)?,
                 data_dir: PathBuf::from(data_dir.try_to_string(env)?),
                 bundle: bundle != 0,
             };
             let reply = match run(request) {
                 Ok(summary) => format!("OK {summary}"),
-                Err(e) => format!("ERR {e:#}"),
+                Err(Failure::Funding(e)) => format!("FUNDING {e:#}"),
+                Err(Failure::Other(e)) => format!("ERR {e:#}"),
             };
             PROGRESS.phase.store(0, Ordering::Relaxed);
+            env.new_string(reply)
+        })
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// The address of the delegate key in `keyFile`, generating a random key
+/// there first when the file is absent. Returns `0x…` or `ERR <message>`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_decdn_demo_Native_address<'local>(
+    mut unowned: EnvUnowned<'local>,
+    _class: JObject<'local>,
+    key_file: JString<'local>,
+) -> JString<'local> {
+    unowned
+        .with_env(|env| -> jni::errors::Result<JString<'local>> {
+            let path = PathBuf::from(key_file.try_to_string(env)?);
+            let reply = match load_or_create_key(&path) {
+                Ok(signer) => signer.address().to_string(),
+                Err(e) => format!("ERR {e:#}"),
+            };
             env.new_string(reply)
         })
         .resolve::<ThrowRuntimeExAndDefault>()
@@ -235,20 +263,41 @@ struct Request {
     namespace: Option<u64>,
     out_dir: PathBuf,
     file_name: String,
-    key_dir: PathBuf,
+    key_file: PathBuf,
+    capability: String,
     data_dir: PathBuf,
     bundle: bool,
 }
 
-fn run(request: Request) -> anyhow::Result<String> {
+/// Why a pull did not finish.
+enum Failure {
+    /// The capability cannot pay for the rest, or does not fit the key: the
+    /// app needs a fresh key and a fresh capability.
+    Funding(anyhow::Error),
+    /// Anything else; a rerun resumes.
+    Other(anyhow::Error),
+}
+
+/// How a pull that ran to its end ended.
+enum Ended {
+    Done(String),
+    FundingNeeded(anyhow::Error),
+}
+
+fn run(request: Request) -> Result<String, Failure> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("start the tokio runtime")?;
-    runtime.block_on(Box::pin(pull(request)))
+        .context("start the tokio runtime")
+        .map_err(Failure::Other)?;
+    match runtime.block_on(Box::pin(pull(request))) {
+        Ok(Ended::Done(summary)) => Ok(summary),
+        Ok(Ended::FundingNeeded(e)) => Err(Failure::Funding(e)),
+        Err(e) => Err(Failure::Other(e)),
+    }
 }
 
-async fn pull(request: Request) -> anyhow::Result<String> {
+async fn pull(request: Request) -> anyhow::Result<Ended> {
     let hash = parse_hash(&request.hash)?;
     PROGRESS.reset(1);
     let chain = ChainConfig {
@@ -267,7 +316,10 @@ async fn pull(request: Request) -> anyhow::Result<String> {
 
     // Resolve the holders first, so a failed discovery costs no key unlock.
     let nodes = select_nodes(&chain, &site, &discovery).await?;
-    let slot = credential(&request.key_dir)?;
+    let slot = match credential(&request.key_file, &request.capability) {
+        Ok(slot) => slot,
+        Err(e) => return Ok(Ended::FundingNeeded(e)),
+    };
     let store = Arc::new(RedbBuyerPoolStore::open(&site.data_dir)?);
     let relays = endpoint::resolve_relays(None, None)?;
     let endpoint = endpoint::client_endpoint(&relays, &endpoint::client_discovery(None)?).await?;
@@ -311,30 +363,58 @@ async fn pull(request: Request) -> anyhow::Result<String> {
 
     let report = &outcome.report;
     let mut summary = format!(
-        "{} fetched, {} skipped, {} failed; paid for {} bytes",
-        report.fetched, report.skipped, report.failed, report.downloaded
+        "{} fetched, {} copied from files already on the phone, {} skipped, {} failed; \
+         paid for {} bytes",
+        report.fetched, report.linked, report.skipped, report.failed, report.downloaded
     );
     for failure in &report.failures {
         summary.push_str(&format!("\n{}: {}", failure.path, failure.error));
     }
     match outcome.end {
-        BundleEnd::Complete if report.failed == 0 => Ok(summary),
+        BundleEnd::Complete if report.failed == 0 => Ok(Ended::Done(summary)),
         BundleEnd::Complete => bail!("{summary}"),
-        BundleEnd::FundingNeeded { error, .. } => Err(error.context("the capability ran out")),
+        BundleEnd::FundingNeeded { error, .. } => Ok(Ended::FundingNeeded(
+            error.context("the capability ran out"),
+        )),
         BundleEnd::Stopped(error) => Err(error),
         _ => bail!("stopped early; download again to resume\n{summary}"),
     }
 }
 
-/// The delegate key and its capability, from the key dir.
-fn credential(dir: &Path) -> anyhow::Result<CredentialSlot> {
-    let password = std::fs::read_to_string(dir.join("password")).context("read password")?;
-    let password = password.strip_suffix('\n').unwrap_or(&password);
-    let signer = load_signer(&dir.join("keystore.json"), password)?;
-    let token = std::fs::read_to_string(dir.join("capability")).context("read capability")?;
+/// The delegate key and the capability issued to it. Fails when the token
+/// does not parse or names another signer.
+fn credential(key_file: &Path, token: &str) -> anyhow::Result<CredentialSlot> {
+    let signer = load_or_create_key(key_file)?;
     let grant = CapabilityGrant::from_token(token.trim())?;
     Ok(CredentialSlot::new(
         Arc::new(signer),
         grant.to_signed_capability()?,
     )?)
+}
+
+/// The throwaway delegate key in `path` (32 bytes, hex), or a fresh random
+/// one written there owner-only. The app's private storage keeps it; it holds
+/// no funds, only the right to spend under the capability issued to it.
+fn load_or_create_key(path: &Path) -> anyhow::Result<PrivateKeySigner> {
+    if let Ok(hex) = std::fs::read_to_string(path) {
+        let bytes: B256 = hex.trim().parse().context("parse the stored key")?;
+        return PrivateKeySigner::from_bytes(&bytes).context("load the stored key");
+    }
+    let signer = PrivateKeySigner::random();
+    let tmp = path.with_extension("tmp");
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .context("create the key file")?;
+        file.write_all(signer.to_bytes().to_string().as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path).context("store the key file")?;
+    Ok(signer)
 }
