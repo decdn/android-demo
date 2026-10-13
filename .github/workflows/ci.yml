@@ -34,15 +34,16 @@ jobs:
       - name: Format
         working-directory: rust
         run: cargo fmt -- --check
+      # The runner image exports its NDK as ANDROID_NDK_ROOT.
       - name: Clippy
         working-directory: rust
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
-        run: cargo ndk -t arm64-v8a -P 30 clippy --release -- -D warnings
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+          cargo ndk -t arm64-v8a -P 30 clippy --release -- -D warnings
       - name: Build
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
-        run: ./build.sh apk
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+          ./build.sh apk
       - uses: actions/upload-artifact@v5
         with:
           name: decdn-android-demo-debug
